@@ -1,8 +1,7 @@
 "use client";
 import React, { useEffect, useRef, useState } from 'react';
 import { Users, Undo, Redo, Trash2, Pencil, Eraser, Save, Download } from 'lucide-react';
-import { supabase } from '@/lib/supabaseClient';
-
+import { supabase } from '@/lib/supabaseClient'
 const CollaborativeCanvas = ({ userId: urlUserId }) => {
   const canvasRef = useRef(null);
   const [tool, setTool] = useState('brush');
@@ -15,6 +14,8 @@ const CollaborativeCanvas = ({ userId: urlUserId }) => {
   const [isDrawing, setIsDrawing] = useState(false);
   const [canvasId] = useState('default-canvas');
   const [isSaving, setIsSaving] = useState(false);
+  const [isLoading, setIsLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   
   const currentPathRef = useRef([]);
   const cursorPositions = useRef({});
@@ -24,20 +25,78 @@ const CollaborativeCanvas = ({ userId: urlUserId }) => {
   // Fetch current user data
   useEffect(() => {
     const fetchUser = async () => {
-      if (!urlUserId) return;
+      setIsLoading(true);
       
-      const { data, error } = await supabase
-        .from('users')
-        .select('id, username, profile_pic')
-        .eq('id', urlUserId)
-        .single();
+      if (!urlUserId) {
+        console.error('No user ID provided');
+        // Set a mock user for testing
+        setCurrentUser({
+          id: 'anonymous_' + Math.random().toString(36).substr(2, 9),
+          username: 'Anonymous User',
+          profile_pic: null
+        });
+        setIsLoading(false);
+        return;
+      }
       
-      if (data) {
-        setCurrentUser(data);
+      try {
+        const { data, error } = await supabase
+          .from('users')
+          .select('id, username, profile_pic')
+          .eq('id', urlUserId)
+          .single();
+        
+        if (error) {
+          console.error('Error fetching user:', error);
+          // Fallback: create a temporary user object
+          setCurrentUser({
+            id: urlUserId,
+            username: `User_${urlUserId.slice(0, 6)}`,
+            profile_pic: null
+          });
+          setLoadError('User not found in database, using temporary profile');
+        } else if (data) {
+          setCurrentUser(data);
+        } else {
+          // User not found, create temporary user
+          setCurrentUser({
+            id: urlUserId,
+            username: `User_${urlUserId.slice(0, 6)}`,
+            profile_pic: null
+          });
+          setLoadError('User not found, using temporary profile');
+        }
+      } catch (err) {
+        console.error('Exception fetching user:', err);
+        // Fallback user
+        setCurrentUser({
+          id: urlUserId,
+          username: `User_${urlUserId.slice(0, 6)}`,
+          profile_pic: null
+        });
+        setLoadError('Failed to connect to database');
+      } finally {
+        setIsLoading(false);
       }
     };
     
+    // Add timeout to prevent infinite loading
+    const timeout = setTimeout(() => {
+      if (!currentUser) {
+        console.warn('User fetch timeout, using fallback');
+        setCurrentUser({
+          id: urlUserId || 'anonymous_' + Math.random().toString(36).substr(2, 9),
+          username: 'Guest User',
+          profile_pic: null
+        });
+        setLoadError('Connection timeout');
+        setIsLoading(false);
+      }
+    }, 5000);
+    
     fetchUser();
+    
+    return () => clearTimeout(timeout);
   }, [urlUserId]);
 
   // Initialize Supabase Realtime
@@ -397,12 +456,16 @@ const CollaborativeCanvas = ({ userId: urlUserId }) => {
     link.click();
   };
 
-  if (!currentUser) {
+  if (!currentUser || isLoading) {
     return (
       <div className="flex items-center justify-center h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto"></div>
           <p className="mt-4 text-gray-600">Loading canvas...</p>
+          <p className="mt-2 text-sm text-gray-500">User ID: {urlUserId || 'Not provided'}</p>
+          {loadError && (
+            <p className="mt-2 text-sm text-amber-600">{loadError}</p>
+          )}
         </div>
       </div>
     );
@@ -410,6 +473,15 @@ const CollaborativeCanvas = ({ userId: urlUserId }) => {
 
   return (
     <div className="flex flex-col h-screen bg-gradient-to-br from-blue-50 via-white to-indigo-50">
+      {/* Error Banner */}
+      {loadError && (
+        <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-center">
+          <p className="text-sm text-amber-800">
+            ⚠️ {loadError} - Canvas will work but data may not persist
+          </p>
+        </div>
+      )}
+      
       {/* Modern Toolbar */}
       <div className="bg-white/80 backdrop-blur-lg shadow-lg border-b border-gray-200/50 p-4">
         <div className="max-w-7xl mx-auto flex items-center gap-6 flex-wrap">
