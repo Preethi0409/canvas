@@ -1,8 +1,8 @@
-"use client";
-import React, { useEffect, useRef, useState } from 'react';
-import { Users, Undo, Redo, Trash2, Pencil, Eraser, Download } from 'lucide-react';
 
-const CollaborativeCanvas = () => {
+import React, { useEffect, useRef, useState } from 'react';
+import { Users, Undo, Redo, Trash2, Pencil, Eraser, Download, Plus, LogIn, Lock, Globe, Copy, Check } from 'lucide-react';
+
+const CollaborativeCanvas = ({ supabase }) => {
   const canvasRef = useRef(null);
   const [tool, setTool] = useState('brush');
   const [color, setColor] = useState('#000000');
@@ -10,13 +10,25 @@ const CollaborativeCanvas = () => {
   const [operations, setOperations] = useState([]);
   const [currentOperationIndex, setCurrentOperationIndex] = useState(-1);
   const [isDrawing, setIsDrawing] = useState(false);
-  const [isLoading, setIsLoading] = useState(true);
-  const [onlineUsers, setOnlineUsers] = useState(1);
   const [username, setUsername] = useState('');
   const [userId, setUserId] = useState('');
+  const [canvasId, setCanvasId] = useState(null);
+  const [onlineUsers, setOnlineUsers] = useState([]);
+  
+  // UI States
+  const [showJoinModal, setShowJoinModal] = useState(true);
+  const [canvasName, setCanvasName] = useState('');
+  const [canvasToJoin, setCanvasToJoin] = useState('');
+  const [isPrivate, setIsPrivate] = useState(false);
+  const [canvasPassword, setCanvasPassword] = useState('');
+  const [joinPassword, setJoinPassword] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [availableCanvases, setAvailableCanvases] = useState([]);
   
   const currentPathRef = useRef([]);
-  const syncIntervalRef = useRef(null);
+  const channelRef = useRef(null);
 
   // Initialize user
   useEffect(() => {
@@ -36,120 +48,214 @@ const CollaborativeCanvas = () => {
     }
   }, []);
 
-  // Load canvas operations from storage
+  // Load available public canvases
   useEffect(() => {
-    const loadCanvas = async () => {
-      if (!userId) return;
+    if (!supabase) return;
+    
+    const loadCanvases = async () => {
+      const { data, error } = await supabase
+        .from('canvases')
+        .select('*')
+        .eq('is_private', false)
+        .order('created_at', { ascending: false })
+        .limit(10);
       
-      try {
-        const result = await window.storage.get('canvas-operations', true);
-        if (result && result.value) {
-          const ops = JSON.parse(result.value);
-          setOperations(ops);
-          setCurrentOperationIndex(ops.length - 1);
-          setTimeout(() => redrawCanvas(ops), 100);
-        }
-        
-        // Update online presence
-        await updatePresence();
-        
-        setIsLoading(false);
-      } catch (error) {
-        console.log('No existing canvas data');
-        setIsLoading(false);
+      if (data) {
+        setAvailableCanvases(data);
       }
     };
     
-    loadCanvas();
-  }, [userId]);
+    loadCanvases();
+  }, [showJoinModal, supabase]);
 
-  // Sync with other users periodically
+  // Setup Realtime subscription when canvas is joined
   useEffect(() => {
-    if (!userId) return;
-    
-    syncIntervalRef.current = setInterval(async () => {
-      try {
-        const result = await window.storage.get('canvas-operations', true);
-        if (result && result.value) {
-          const ops = JSON.parse(result.value);
-          // Check if operations changed by comparing length and last timestamp
-          const shouldUpdate = ops.length !== operations.length || 
-            (ops.length > 0 && operations.length > 0 && 
-             ops[ops.length - 1]?.timestamp !== operations[operations.length - 1]?.timestamp);
+    if (!canvasId || !userId || !supabase) return;
+
+    const channel = supabase.channel(`canvas:${canvasId}`, {
+      config: {
+        broadcast: { self: false },
+        presence: { key: userId }
+      }
+    });
+
+    channel
+      .on('presence', { event: 'sync' }, () => {
+        const presenceState = channel.presenceState();
+        const activeUsers = Object.values(presenceState).flat();
+        setOnlineUsers(activeUsers);
+      })
+      .on('broadcast', { event: 'draw:operation' }, ({ payload }) => {
+        if (payload.userId !== userId) {
+          setOperations(prev => {
+            const newOps = [...prev, payload];
+            setCurrentOperationIndex(newOps.length - 1);
+            setTimeout(() => drawPath(canvasRef.current?.getContext('2d'), payload), 0);
+            return newOps;
+          });
+        }
+      })
+      .on('broadcast', { event: 'canvas:undo' }, () => {
+        handleRemoteUndo();
+      })
+      .on('broadcast', { event: 'canvas:redo' }, () => {
+        handleRemoteRedo();
+      })
+      .on('broadcast', { event: 'canvas:clear' }, () => {
+        handleRemoteClear();
+      })
+      .on('postgres_changes', {
+        event: '*',
+        schema: 'public',
+        table: 'canvas_operations',
+        filter: `canvas_id=eq.${canvasId}`
+      }, (payload) => {
+        if (payload.eventType === 'INSERT' && payload.new.user_id !== userId) {
+          const operation = {
+            id: payload.new.id,
+            userId: payload.new.user_id,
+            tool: payload.new.tool,
+            color: payload.new.color,
+            lineWidth: payload.new.line_width,
+            points: payload.new.points,
+            timestamp: new Date(payload.new.created_at).getTime()
+          };
           
-          if (shouldUpdate) {
-            setOperations(ops);
-            setCurrentOperationIndex(ops.length - 1);
-            setTimeout(() => redrawCanvas(ops), 0);
-          }
+          setOperations(prev => {
+            const newOps = [...prev, operation];
+            setCurrentOperationIndex(newOps.length - 1);
+            setTimeout(() => drawPath(canvasRef.current?.getContext('2d'), operation), 0);
+            return newOps;
+          });
         }
-        
-        // Update presence
-        await updatePresence();
-        await countOnlineUsers();
-      } catch (error) {
-        console.log('Sync error:', error);
-      }
-    }, 1000); // Faster sync - every 1 second
-    
+      })
+      .subscribe(async (status) => {
+        if (status === 'SUBSCRIBED') {
+          await channel.track({
+            id: userId,
+            username: username,
+            online_at: new Date().toISOString()
+          });
+        }
+      });
+
+    channelRef.current = channel;
+
+    // Load existing operations
+    loadCanvasOperations();
+
     return () => {
-      if (syncIntervalRef.current) {
-        clearInterval(syncIntervalRef.current);
-      }
+      channel.unsubscribe();
     };
-  }, [userId, operations]);
+  }, [canvasId, userId, username, supabase]);
 
-  const updatePresence = async () => {
-    try {
-      const presence = {
-        userId,
-        username,
-        timestamp: Date.now()
-      };
-      await window.storage.set(`presence:${userId}`, JSON.stringify(presence), true);
-    } catch (error) {
-      console.log('Presence update error:', error);
+  const loadCanvasOperations = async () => {
+    if (!supabase || !canvasId) return;
+    
+    const { data, error } = await supabase
+      .from('canvas_operations')
+      .select('*')
+      .eq('canvas_id', canvasId)
+      .order('created_at', { ascending: true });
+
+    if (data) {
+      const ops = data.map(op => ({
+        id: op.id,
+        userId: op.user_id,
+        tool: op.tool,
+        color: op.color,
+        lineWidth: op.line_width,
+        points: op.points,
+        timestamp: new Date(op.created_at).getTime()
+      }));
+      
+      setOperations(ops);
+      setCurrentOperationIndex(ops.length - 1);
+      
+      setTimeout(() => {
+        redrawCanvas(ops);
+      }, 100);
     }
   };
 
-  const countOnlineUsers = async () => {
+  const createCanvas = async () => {
+    if (!canvasName.trim()) {
+      setError('Please enter a canvas name');
+      return;
+    }
+    
+    if (isPrivate && !canvasPassword.trim()) {
+      setError('Please enter a password for private canvas');
+      return;
+    }
+
+    setIsLoading(true);
+    setError('');
+
     try {
-      const result = await window.storage.list('presence:', true);
-      if (result && result.keys) {
-        // Count users active in last 10 seconds
-        const now = Date.now();
-        let activeCount = 0;
-        
-        for (const key of result.keys) {
-          try {
-            const userData = await window.storage.get(key, true);
-            if (userData && userData.value) {
-              const user = JSON.parse(userData.value);
-              if (now - user.timestamp < 10000) {
-                activeCount++;
-              }
-            }
-          } catch (e) {
-            console.log('Error counting user:', e);
-          }
-        }
-        
-        setOnlineUsers(Math.max(1, activeCount));
+      const newCanvasId = 'canvas_' + Math.random().toString(36).substr(2, 9);
+      
+      const { data, error } = await supabase
+        .from('canvases')
+        .insert({
+          id: newCanvasId,
+          name: canvasName,
+          is_private: isPrivate,
+          password: isPrivate ? canvasPassword : null,
+          created_by: userId
+        })
+        .select()
+        .single();
+
+      if (error) throw error;
+
+      setCanvasId(newCanvasId);
+      setShowJoinModal(false);
+    } catch (err) {
+      setError('Failed to create canvas: ' + err.message);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const joinCanvas = async (targetCanvasId = null) => {
+    const idToJoin = targetCanvasId || canvasToJoin.trim();
+    
+    if (!idToJoin) {
+      setError('Please enter a canvas ID');
+      return;
+    }
+
+    setIsLoading(true);
+    setError('');
+
+    try {
+      const { data, error } = await supabase
+        .from('canvases')
+        .select('*')
+        .eq('id', idToJoin)
+        .single();
+
+      if (error || !data) {
+        throw new Error('Canvas not found');
       }
-    } catch (error) {
-      console.log('Error counting users:', error);
-    }
-  };
 
-  const saveOperations = async (ops) => {
-    try {
-      await window.storage.set('canvas-operations', JSON.stringify(ops), true);
-    } catch (error) {
-      console.error('Error saving operations:', error);
+      if (data.is_private && data.password !== joinPassword) {
+        throw new Error('Incorrect password');
+      }
+
+      setCanvasId(idToJoin);
+      setShowJoinModal(false);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setIsLoading(false);
     }
   };
 
   const drawPath = (ctx, operation) => {
+    if (!ctx) return;
+    
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
     ctx.strokeStyle = operation.tool === 'eraser' ? '#FFFFFF' : operation.color;
@@ -239,55 +345,112 @@ const CollaborativeCanvas = () => {
         timestamp: Date.now()
       };
 
-      // Get current operations from storage to avoid conflicts
-      let currentOps = [];
-      try {
-        const result = await window.storage.get('canvas-operations', true);
-        if (result && result.value) {
-          currentOps = JSON.parse(result.value);
-        }
-      } catch (e) {
-        console.log('No existing operations');
-      }
+      // Save to database
+      const { data, error } = await supabase
+        .from('canvas_operations')
+        .insert({
+          canvas_id: canvasId,
+          user_id: userId,
+          tool,
+          color,
+          line_width: lineWidth,
+          points: operation.points
+        })
+        .select()
+        .single();
 
-      const newOps = [...currentOps, operation];
-      setOperations(newOps);
-      setCurrentOperationIndex(newOps.length - 1);
-      
-      await saveOperations(newOps);
+      if (data) {
+        operation.id = data.id;
+        
+        // Broadcast to other users
+        channelRef.current?.send({
+          type: 'broadcast',
+          event: 'draw:operation',
+          payload: operation
+        });
+        
+        setOperations(prev => {
+          const newOps = [...prev, operation];
+          setCurrentOperationIndex(newOps.length - 1);
+          return newOps;
+        });
+      }
     }
 
     currentPathRef.current = [];
   };
 
-  const handleUndo = async () => {
+  const handleUndo = () => {
     if (currentOperationIndex >= 0) {
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'canvas:undo',
+        payload: {}
+      });
+      
       const newIndex = currentOperationIndex - 1;
       setCurrentOperationIndex(newIndex);
-      const newOps = operations.slice(0, newIndex + 1);
-      redrawCanvas(newOps);
-      await saveOperations(operations);
+      redrawCanvas(operations.slice(0, newIndex + 1));
     }
   };
 
-  const handleRedo = async () => {
+  const handleRedo = () => {
     if (currentOperationIndex < operations.length - 1) {
+      channelRef.current?.send({
+        type: 'broadcast',
+        event: 'canvas:redo',
+        payload: {}
+      });
+      
       const newIndex = currentOperationIndex + 1;
       setCurrentOperationIndex(newIndex);
-      const newOps = operations.slice(0, newIndex + 1);
-      redrawCanvas(newOps);
-      await saveOperations(operations);
+      redrawCanvas(operations.slice(0, newIndex + 1));
     }
   };
 
   const handleClear = async () => {
+    await supabase
+      .from('canvas_operations')
+      .delete()
+      .eq('canvas_id', canvasId);
+
+    channelRef.current?.send({
+      type: 'broadcast',
+      event: 'canvas:clear',
+      payload: {}
+    });
+    
     setOperations([]);
     setCurrentOperationIndex(-1);
-    await window.storage.delete('canvas-operations', true);
-    
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
     ctx.clearRect(0, 0, canvas.width, canvas.height);
+  };
+
+  const handleRemoteUndo = () => {
+    setCurrentOperationIndex(prev => {
+      const newIndex = Math.max(-1, prev - 1);
+      redrawCanvas(operations.slice(0, newIndex + 1));
+      return newIndex;
+    });
+  };
+
+  const handleRemoteRedo = () => {
+    setCurrentOperationIndex(prev => {
+      const newIndex = Math.min(operations.length - 1, prev + 1);
+      redrawCanvas(operations.slice(0, newIndex + 1));
+      return newIndex;
+    });
+  };
+
+  const handleRemoteClear = () => {
+    setOperations([]);
+    setCurrentOperationIndex(-1);
+    const canvas = canvasRef.current;
+    const ctx = canvas?.getContext('2d');
+    if (ctx) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    }
   };
 
   const handleDownload = () => {
@@ -299,12 +462,131 @@ const CollaborativeCanvas = () => {
     link.click();
   };
 
-  if (isLoading) {
+  const copyCanvasId = () => {
+    navigator.clipboard.writeText(canvasId);
+    setCopied(true);
+    setTimeout(() => setCopied(false), 2000);
+  };
+
+  if (showJoinModal) {
     return (
-      <div className="flex items-center justify-center h-screen bg-gradient-to-br from-blue-50 to-indigo-100">
-        <div className="text-center">
-          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-indigo-600 mx-auto"></div>
-          <p className="mt-4 text-gray-600">Loading canvas...</p>
+      <div className="flex items-center justify-center min-h-screen bg-gradient-to-br from-blue-50 to-indigo-100 p-4">
+        <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-2xl w-full">
+          <h1 className="text-3xl font-bold text-gray-800 mb-6 text-center">Collaborative Canvas</h1>
+          
+          <div className="space-y-6">
+            {/* Create New Canvas */}
+            <div className="border-2 border-gray-200 rounded-xl p-6">
+              <div className="flex items-center gap-2 mb-4">
+                <Plus className="text-indigo-600" size={24} />
+                <h2 className="text-xl font-semibold text-gray-800">Create New Canvas</h2>
+              </div>
+              
+              <input
+                type="text"
+                placeholder="Canvas Name"
+                value={canvasName}
+                onChange={(e) => setCanvasName(e.target.value)}
+                className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg mb-3 focus:border-indigo-500 focus:outline-none"
+              />
+              
+              <div className="flex items-center gap-4 mb-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={isPrivate}
+                    onChange={(e) => setIsPrivate(e.target.checked)}
+                    className="w-5 h-5"
+                  />
+                  <Lock size={18} />
+                  <span className="text-sm font-medium">Private Canvas</span>
+                </label>
+              </div>
+              
+              {isPrivate && (
+                <input
+                  type="password"
+                  placeholder="Set Password"
+                  value={canvasPassword}
+                  onChange={(e) => setCanvasPassword(e.target.value)}
+                  className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg mb-3 focus:border-indigo-500 focus:outline-none"
+                />
+              )}
+              
+              <button
+                onClick={createCanvas}
+                disabled={isLoading}
+                className="w-full bg-indigo-600 text-white py-3 rounded-lg font-semibold hover:bg-indigo-700 transition-colors disabled:opacity-50"
+              >
+                {isLoading ? 'Creating...' : 'Create Canvas'}
+              </button>
+            </div>
+
+            {/* Join Existing Canvas */}
+            <div className="border-2 border-gray-200 rounded-xl p-6">
+              <div className="flex items-center gap-2 mb-4">
+                <LogIn className="text-green-600" size={24} />
+                <h2 className="text-xl font-semibold text-gray-800">Join Canvas</h2>
+              </div>
+              
+              <input
+                type="text"
+                placeholder="Canvas ID"
+                value={canvasToJoin}
+                onChange={(e) => setCanvasToJoin(e.target.value)}
+                className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg mb-3 focus:border-green-500 focus:outline-none"
+              />
+              
+              <input
+                type="password"
+                placeholder="Password (if private)"
+                value={joinPassword}
+                onChange={(e) => setJoinPassword(e.target.value)}
+                className="w-full px-4 py-3 border-2 border-gray-300 rounded-lg mb-3 focus:border-green-500 focus:outline-none"
+              />
+              
+              <button
+                onClick={() => joinCanvas()}
+                disabled={isLoading}
+                className="w-full bg-green-600 text-white py-3 rounded-lg font-semibold hover:bg-green-700 transition-colors disabled:opacity-50"
+              >
+                {isLoading ? 'Joining...' : 'Join Canvas'}
+              </button>
+            </div>
+
+            {/* Available Public Canvases */}
+            {availableCanvases.length > 0 && (
+              <div className="border-2 border-gray-200 rounded-xl p-6">
+                <div className="flex items-center gap-2 mb-4">
+                  <Globe className="text-blue-600" size={24} />
+                  <h2 className="text-xl font-semibold text-gray-800">Public Canvases</h2>
+                </div>
+                
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {availableCanvases.map((canvas) => (
+                    <button
+                      key={canvas.id}
+                      onClick={() => joinCanvas(canvas.id)}
+                      className="w-full text-left px-4 py-3 bg-gray-50 hover:bg-gray-100 rounded-lg transition-colors"
+                    >
+                      <div className="font-medium text-gray-800">{canvas.name}</div>
+                      <div className="text-xs text-gray-500 mt-1">ID: {canvas.id}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {error && (
+            <div className="mt-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-600 text-sm">
+              {error}
+            </div>
+          )}
+          
+          <div className="mt-6 text-center text-sm text-gray-500">
+            Logged in as <strong>{username}</strong>
+          </div>
         </div>
       </div>
     );
@@ -397,13 +679,36 @@ const CollaborativeCanvas = () => {
             </button>
           </div>
 
+          {/* Canvas ID */}
+          <button
+            onClick={copyCanvasId}
+            className="flex items-center gap-2 bg-gradient-to-r from-purple-50 to-pink-50 rounded-xl px-4 py-2 hover:from-purple-100 hover:to-pink-100 transition-colors"
+            title="Click to copy Canvas ID"
+          >
+            {copied ? <Check size={16} className="text-green-600" /> : <Copy size={16} className="text-purple-600" />}
+            <span className="text-sm font-mono text-gray-700">{canvasId}</span>
+          </button>
+
           {/* Users */}
           <div className="ml-auto flex items-center gap-3 bg-gradient-to-r from-indigo-50 to-blue-50 rounded-xl px-4 py-2">
             <Users size={20} className="text-indigo-600" />
-            <span className="text-sm font-semibold text-gray-700">{onlineUsers} online</span>
-            <div className="flex items-center gap-2">
-              <div className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></div>
-              <span className="text-xs text-gray-600">{username}</span>
+            <span className="text-sm font-semibold text-gray-700">{onlineUsers.length} online</span>
+            <div className="flex -space-x-2">
+              {onlineUsers.slice(0, 5).map((user, idx) => (
+                <div
+                  key={user.id}
+                  className="w-9 h-9 rounded-full border-3 border-white shadow-md flex items-center justify-center overflow-hidden bg-gradient-to-br from-purple-500 to-pink-500"
+                  title={user.username}
+                  style={{ zIndex: 10 - idx }}
+                >
+                  <span className="text-white text-xs font-bold">{user.username?.[0]?.toUpperCase()}</span>
+                </div>
+              ))}
+              {onlineUsers.length > 5 && (
+                <div className="w-9 h-9 rounded-full border-3 border-white shadow-md flex items-center justify-center bg-gray-400 text-white text-xs font-bold">
+                  +{onlineUsers.length - 5}
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -432,11 +737,12 @@ const CollaborativeCanvas = () => {
           <div className="flex items-center gap-4">
             <span className="flex items-center gap-2">
               <span className="w-2 h-2 bg-green-500 rounded-full animate-pulse"></span>
-              Shared Canvas - All users see the same drawing
+              Real-time Collaboration
             </span>
+            <span>{operations.length} operations</span>
           </div>
           <div>
-            {operations.length} operations saved
+            <strong>{username}</strong>
           </div>
         </div>
       </div>
