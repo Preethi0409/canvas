@@ -113,8 +113,10 @@ export default function CanvassLanding() {
           
           <div className="flex flex-col sm:flex-row items-center justify-center gap-4">
             <button className="group bg-gradient-to-r from-purple-500 to-pink-500 px-8 py-4 rounded-full font-semibold text-lg hover:shadow-2xl hover:shadow-purple-500/50 transition-all duration-300 hover:scale-105 flex items-center space-x-2">
+              <a href='/canvas'>
               <span>Start Drawing Now</span>
               <ArrowRight className="w-5 h-5 group-hover:translate-x-1 transition-transform" />
+              </a>
             </button>
             <button className="px-8 py-4 rounded-full font-semibold text-lg border-2 border-purple-500/30 hover:border-purple-500 hover:bg-purple-500/10 transition-all duration-300">
               Watch Demo
