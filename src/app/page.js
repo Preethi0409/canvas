@@ -78,8 +78,9 @@ export default function CanvassLanding() {
             <a href="#how" className="hover:text-purple-400 transition-colors">How It Works</a>
             <a href="#pricing" className="hover:text-purple-400 transition-colors">Pricing</a>
           </div>
+
           <button className="bg-gradient-to-r from-purple-500 to-pink-500 px-6 py-2.5 rounded-full font-semibold hover:shadow-lg hover:shadow-purple-500/50 transition-all duration-300 hover:scale-105">
-            Get Started
+            <a href='/canvas'>Get Started</a>
           </button>
         </div>
       </nav>
